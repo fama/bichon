@@ -89,22 +89,57 @@ impl<E: Endpoint> Endpoint for ApiGuardEndpoint<E> {
 ///   - The default admin user exists in the DB (so the synthesized context has
 ///     real ROOT-tier permissions through the existing `is_admin()` path)
 fn try_local_admin_bypass(req: &Request) -> Option<ClientContext> {
+    let path = req.uri().path();
+    // Per-request short-circuit: settings off → nothing to log; we don't want
+    // to spam a debug line for every unrelated request when the feature is
+    // disabled.
     if !SETTINGS.bichon_local_admin_bypass {
         return None;
     }
-    let path = req.uri().path();
+    // From here on, every fall-through emits a debug line so an operator who
+    // turned the setting on but is still seeing "Valid access token not
+    // found" can grep server logs and see which condition rejected the
+    // request.
     if !LOCAL_ADMIN_BYPASS_PATHS.iter().any(|p| path.starts_with(p)) {
+        tracing::debug!(path, "local_admin_bypass: path not in allowlist");
         return None;
     }
+    let remote = req.remote_addr().to_string();
     if !is_request_loopback(req) {
+        tracing::debug!(
+            path,
+            remote,
+            "local_admin_bypass: TCP remote is not loopback (call from inside the container)"
+        );
         return None;
     }
     if has_proxy_forward_headers(req) {
+        tracing::debug!(
+            path,
+            remote,
+            "local_admin_bypass: rejected because X-Forwarded-For / X-Real-IP / Forwarded header is present"
+        );
         return None;
     }
-    let admin = find_impl::<UserModel>(DB_MANAGER.db(), &DEFAULT_ADMIN_USER_ID.to_string())
-        .ok()
-        .flatten()?;
+    let admin = match find_impl::<UserModel>(DB_MANAGER.db(), &DEFAULT_ADMIN_USER_ID.to_string()) {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            tracing::warn!(
+                path,
+                "local_admin_bypass: default admin user not found in DB; cannot synthesize context"
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(
+                path,
+                error = ?e,
+                "local_admin_bypass: failed to load default admin user from DB"
+            );
+            return None;
+        }
+    };
+    tracing::info!(path, remote, "local_admin_bypass: granted");
     Some(ClientContext {
         ip_addr: parse_remote_ip(req),
         user: admin,
