@@ -55,6 +55,7 @@ pub struct SystemConfigurations {
     pub bichon_data_dir: Option<String>,
 
     pub bichon_enable_smtp: bool,
+    pub bichon_local_admin_bypass: bool,
     pub bichon_smtp_port: u16,
     pub bichon_smtp_encryption: String,
     pub bichon_smtp_auth_required: bool,
@@ -100,6 +101,7 @@ impl From<&Settings> for SystemConfigurations {
             bichon_index_dir: s.bichon_index_dir.clone(),
             bichon_data_dir: s.bichon_data_dir.clone(),
             bichon_enable_smtp: s.bichon_enable_smtp,
+            bichon_local_admin_bypass: s.bichon_local_admin_bypass,
             bichon_smtp_port: s.bichon_smtp_port,
             bichon_smtp_encryption: s.bichon_smtp_encryption.to_string(),
             bichon_smtp_auth_required: s.bichon_smtp_auth_required,

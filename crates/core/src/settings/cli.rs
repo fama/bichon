@@ -253,6 +253,16 @@ pub struct Settings {
     #[clap(
         long,
         env,
+        default_value = "false",
+        help = "Allow loopback requests to admin-only repair endpoints without an access token. \
+                Intended for in-container `curl localhost` ops use; off by default. \
+                Currently scoped to POST /api/v1/repair-blobs/:account_id."
+    )]
+    pub bichon_local_admin_bypass: bool,
+
+    #[clap(
+        long,
+        env,
         help = "Path to the SMTP TLS private key file (e.g., key.pem)",
         value_parser = ValueParser::new(|s: &str| {
             let path = PathBuf::from(s);

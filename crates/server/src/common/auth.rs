@@ -17,7 +17,12 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use bichon_core::{
-    common::auth::ClientContext, error::code::ErrorCode, token::AccessTokenModel,
+    common::auth::ClientContext,
+    database::{find_impl, manager::DB_MANAGER},
+    error::code::ErrorCode,
+    settings::cli::SETTINGS,
+    token::AccessTokenModel,
+    users::{UserModel, DEFAULT_ADMIN_USER_ID},
     utils::rate_limit::RATE_LIMITER_MANAGER,
 };
 use governor::clock::{Clock, QuantaClock};
@@ -29,9 +34,14 @@ use poem::{
     Endpoint, FromRequest, Middleware, Request, RequestBody, Result,
 };
 use serde::Deserialize;
-use std::{ops::Deref, sync::Arc};
+use std::{net::IpAddr, ops::Deref, sync::Arc};
 
 use super::create_api_error_response;
+
+/// Path prefix for endpoints whose ROOT-only access can be granted via the
+/// in-container loopback bypass (`bichon_local_admin_bypass`). Kept narrow
+/// on purpose: extending the allowlist requires a deliberate code change.
+const LOCAL_ADMIN_BYPASS_PATHS: &[&str] = &["/api/v1/repair-blobs/"];
 
 pub struct ApiGuard;
 
@@ -56,10 +66,75 @@ impl<E: Endpoint> Endpoint for ApiGuardEndpoint<E> {
     type Output = E::Output;
 
     async fn call(&self, mut req: Request) -> Result<Self::Output> {
+        if let Some(ctx) = try_local_admin_bypass(&req) {
+            req.set_data(Arc::new(ctx));
+            return self.ep.call(req).await;
+        }
         let context = authorize_access(&req).await?;
         req.set_data(Arc::new(context));
         self.ep.call(req).await
     }
+}
+
+/// Returns a synthetic admin `ClientContext` when the request is eligible for
+/// the in-container loopback bypass, otherwise `None` (normal auth applies).
+///
+/// All conditions must hold:
+///   - `bichon_local_admin_bypass = true` in settings
+///   - The request path matches one of `LOCAL_ADMIN_BYPASS_PATHS`
+///   - The raw TCP remote address is a loopback IP (no proxy hop)
+///   - The request carries no proxy-forwarding headers (defense-in-depth: a
+///     local-only proxy forwarding external traffic would otherwise become a
+///     bypass vector)
+///   - The default admin user exists in the DB (so the synthesized context has
+///     real ROOT-tier permissions through the existing `is_admin()` path)
+fn try_local_admin_bypass(req: &Request) -> Option<ClientContext> {
+    if !SETTINGS.bichon_local_admin_bypass {
+        return None;
+    }
+    let path = req.uri().path();
+    if !LOCAL_ADMIN_BYPASS_PATHS.iter().any(|p| path.starts_with(p)) {
+        return None;
+    }
+    if !is_request_loopback(req) {
+        return None;
+    }
+    if has_proxy_forward_headers(req) {
+        return None;
+    }
+    let admin = find_impl::<UserModel>(DB_MANAGER.db(), &DEFAULT_ADMIN_USER_ID.to_string())
+        .ok()
+        .flatten()?;
+    Some(ClientContext {
+        ip_addr: parse_remote_ip(req),
+        user: admin,
+    })
+}
+
+fn is_request_loopback(req: &Request) -> bool {
+    parse_remote_ip(req).map(|ip| ip.is_loopback()).unwrap_or(false)
+}
+
+/// Parse the TCP-level remote IP from `req.remote_addr()`. This deliberately
+/// ignores X-Forwarded-For / X-Real-IP: the loopback check is about the actual
+/// connection, not what a proxy claims.
+fn parse_remote_ip(req: &Request) -> Option<IpAddr> {
+    let s = req.remote_addr().to_string();
+    // SocketAddr Display form is "ip:port" (IPv4) or "[ip]:port" (IPv6).
+    // Strip the port and any brackets, then parse.
+    let host = match s.rsplit_once(':') {
+        Some((host, _port)) => host,
+        None => s.as_str(),
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.parse::<IpAddr>().ok()
+}
+
+fn has_proxy_forward_headers(req: &Request) -> bool {
+    let h = req.headers();
+    h.contains_key("x-forwarded-for")
+        || h.contains_key("x-real-ip")
+        || h.contains_key("forwarded")
 }
 
 pub struct WrappedContext(pub ClientContext);
@@ -73,6 +148,13 @@ impl Deref for WrappedContext {
 
 impl<'a> FromRequest<'a> for WrappedContext {
     async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self> {
+        // ApiGuard already authenticated (or bypassed) and stashed the context
+        // in request data. Reuse it instead of re-extracting from the bearer
+        // header — without this fallback, the loopback bypass would be
+        // overridden by a "Valid access token not found" error here.
+        if let Some(ctx) = req.data::<Arc<ClientContext>>() {
+            return Ok(WrappedContext((**ctx).clone()));
+        }
         let ctx = extract_client_context(req).await?;
         Ok(WrappedContext(ctx))
     }
