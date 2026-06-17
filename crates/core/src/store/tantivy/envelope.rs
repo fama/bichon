@@ -974,7 +974,7 @@ impl IndexManager {
         &self,
         account_id: u64,
     ) -> BichonResult<Vec<EnvelopeRepairInfo>> {
-        let query = self.account_query(account_id);
+        let query: Box<dyn Query> = self.account_query(account_id);
         let searcher = self.create_searcher()?;
         let docs = searcher
             .search(&query, &DocSetCollector)
