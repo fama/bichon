@@ -141,11 +141,9 @@ impl MessageApi {
         let account_id = account_id.0;
         let block_remote = block_remote_content.0.unwrap_or(false);
         context.require_permission(Some(account_id), Permission::DATA_READ)?;
-        Ok(Json(retrieve_email_content(
-            account_id,
-            envelope_id.0,
-            block_remote,
-        )?))
+        Ok(Json(
+            retrieve_email_content(account_id, envelope_id.0, block_remote).await?,
+        ))
     }
 
     /// Retrieves the content of an email embedded as an attachment.
@@ -168,12 +166,10 @@ impl MessageApi {
         let block_remote = block_remote_content.0.unwrap_or(false);
         context.require_permission(Some(account_id), Permission::DATA_READ)?;
         let content_hash = content_hash.0.trim();
-        Ok(Json(retrieve_nested_eml_content(
-            account_id,
-            envelope_id.0,
-            content_hash,
-            block_remote,
-        )?))
+        Ok(Json(
+            retrieve_nested_eml_content(account_id, envelope_id.0, content_hash, block_remote)
+                .await?,
+        ))
     }
 
     /// Retrieves the envelope (metadata) of a specific message.
@@ -272,7 +268,7 @@ impl MessageApi {
         AccountModel::check_account_exists(account_id)?;
         context.require_permission(Some(account_id), Permission::DATA_READ)?;
         let content_hash = content_hash.0.trim();
-        let reader = retrieve_attachment_content(account_id, envelope_id, content_hash)?;
+        let reader = retrieve_attachment_content(account_id, envelope_id, content_hash).await?;
         let body = Body::from_async_read(reader);
         let attachment = Attachment::new(body)
             .attachment_type(AttachmentType::Attachment)
@@ -335,7 +331,8 @@ impl MessageApi {
             envelope_id,
             content_hash,
             nested_content_hash,
-        )?;
+        )
+        .await?;
         let body = Body::from_async_read(reader);
         let attachment = Attachment::new(body)
             .attachment_type(AttachmentType::Attachment)

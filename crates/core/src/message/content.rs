@@ -18,7 +18,9 @@
 
 use crate::account::migration::AccountModel;
 use crate::base64_encode;
-use crate::envelope::extractor::{extract_envelope_from_nested_message, reattach_eml_content};
+use crate::envelope::extractor::{
+    extract_envelope_from_nested_message, reattach_eml_content_self_healing,
+};
 use crate::error::code::ErrorCode;
 use crate::store::envelope::Envelope;
 use crate::utils::compute_content_hash;
@@ -172,13 +174,13 @@ pub struct FullNestedMessageContent {
     pub has_remote_content: bool,
 }
 
-pub fn retrieve_email_content(
+pub async fn retrieve_email_content(
     account_id: u64,
     envelope_id: String,
     block_remote: bool,
 ) -> BichonResult<FullMessageContent> {
     AccountModel::check_account_exists(account_id)?;
-    let (envelope, eml) = reattach_eml_content(account_id, envelope_id)?;
+    let (envelope, eml) = reattach_eml_content_self_healing(account_id, envelope_id).await?;
     let message = MessageParser::default().parse(&eml).ok_or_else(|| {
         raise_error!(
             "Failed to parse EML data — the message may be corrupted.".into(),
@@ -260,13 +262,13 @@ pub fn retrieve_email_content(
     })
 }
 
-pub fn retrieve_nested_eml_content(
+pub async fn retrieve_nested_eml_content(
     account_id: u64,
     envelope_id: String,
     content_hash: &str,
     block_remote: bool,
 ) -> BichonResult<FullNestedMessageContent> {
-    let (_, eml) = reattach_eml_content(account_id, envelope_id)?;
+    let (_, eml) = reattach_eml_content_self_healing(account_id, envelope_id).await?;
     let parent_message = MessageParser::default().parse(&eml).ok_or_else(|| {
         raise_error!(
             "Failed to parse parent EML".into(),

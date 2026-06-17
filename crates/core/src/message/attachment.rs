@@ -4,7 +4,7 @@ use crate::{
     raise_error,
     {
         dashboard::Group,
-        envelope::extractor::reattach_eml_content,
+        envelope::extractor::reattach_eml_content_self_healing,
         error::{code::ErrorCode, BichonResult},
         utils::compute_content_hash,
     },
@@ -33,12 +33,12 @@ pub struct AttachmentMetadata {
     pub content_types: Vec<Group>,
 }
 
-pub fn retrieve_attachment_content(
+pub async fn retrieve_attachment_content(
     account_id: u64,
     envelope_id: String,
     content_hash: &str,
 ) -> BichonResult<Cursor<Bytes>> {
-    let (_, eml) = reattach_eml_content(account_id, envelope_id)?;
+    let (_, eml) = reattach_eml_content_self_healing(account_id, envelope_id).await?;
     let message = MessageParser::default()
         .parse(&eml)
         .ok_or_else(|| raise_error!("Failed to parse EML".into(), ErrorCode::InternalError))?;
@@ -56,13 +56,13 @@ pub fn retrieve_attachment_content(
     Ok(Cursor::new(Bytes::copy_from_slice(attachment_content)))
 }
 
-pub fn retrieve_nested_attachment_content(
+pub async fn retrieve_nested_attachment_content(
     account_id: u64,
     envelope_id: String,
     content_hash: &str,
     nested_content_hash: &str,
 ) -> BichonResult<Cursor<Bytes>> {
-    let (_, eml) = reattach_eml_content(account_id, envelope_id)?;
+    let (_, eml) = reattach_eml_content_self_healing(account_id, envelope_id).await?;
     let parent_message = MessageParser::default().parse(&eml).ok_or_else(|| {
         raise_error!(
             "Failed to parse parent EML".into(),
