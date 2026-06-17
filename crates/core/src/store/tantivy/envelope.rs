@@ -81,6 +81,24 @@ use tracing::{info, warn};
 
 pub static ENVELOPE_MANAGER: LazyLock<IndexManager> = LazyLock::new(IndexManager::new);
 
+/// Delay before the deferred blob-GC pass runs after an envelope delete.
+///
+/// Must outlive the ingest worker's longest commit-cycle latency (60 s
+/// periodic commit, or sooner when 1000 docs are buffered) so that any
+/// envelope queued just before the delete has been added to the index and is
+/// visible to the ref-count check. See `cleanup_unused_content` for the full
+/// rationale.
+const BLOB_GC_DELAY_SECS: u64 = 90;
+
+/// Per-envelope fields needed to detect and repair a missing detached EML blob.
+#[derive(Debug, Clone)]
+pub struct EnvelopeRepairInfo {
+    pub envelope_id: String,
+    pub mailbox_id: u64,
+    pub uid: u32,
+    pub content_hash: String,
+}
+
 pub struct IndexManager {
     index: Arc<Index>,
     index_writer: Arc<Mutex<IndexWriter>>,
@@ -948,6 +966,53 @@ impl IndexManager {
         Ok(())
     }
 
+    /// Returns one entry per envelope in the account, with the fields needed to
+    /// look up its detached EML blob (`content_hash`) and, if the blob is
+    /// missing, re-fetch it from IMAP (`mailbox_id`, `uid`). Envelopes missing
+    /// any of these stored fields are skipped silently.
+    pub fn scan_envelopes_for_repair(
+        &self,
+        account_id: u64,
+    ) -> BichonResult<Vec<EnvelopeRepairInfo>> {
+        let query = self.account_query(account_id);
+        let searcher = self.create_searcher()?;
+        let docs = searcher
+            .search(&query, &DocSetCollector)
+            .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
+
+        let f = SchemaTools::email_fields();
+        let mut out = Vec::with_capacity(docs.len());
+        for doc_address in docs {
+            let doc = searcher
+                .doc::<TantivyDocument>(doc_address)
+                .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
+            let envelope_id = doc
+                .get_first(f.f_id)
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let mailbox_id = doc.get_first(f.f_mailbox_id).and_then(|v| v.as_u64());
+            let uid = doc
+                .get_first(f.f_uid)
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32);
+            let content_hash = doc
+                .get_first(f.f_content_hash)
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            if let (Some(envelope_id), Some(mailbox_id), Some(uid), Some(content_hash)) =
+                (envelope_id, mailbox_id, uid, content_hash)
+            {
+                out.push(EnvelopeRepairInfo {
+                    envelope_id,
+                    mailbox_id,
+                    uid,
+                    content_hash,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     fn collect_content_hashes(
         &self,
         query: Box<dyn Query>,
@@ -1011,46 +1076,87 @@ impl IndexManager {
         eml_content_hashes: HashSet<String>,
         attachments_content_hashes: HashSet<String>,
     ) -> BichonResult<()> {
-        // Reference-count barrier: commit the writer and reload the reader so the
-        // `Count` below is evaluated against a fully committed, freshly-reloaded
-        // index state. Without this, an envelope that shares a content hash but
-        // is still sitting uncommitted in the writer buffer (e.g. added by the
-        // background ingest task before this delete acquired the writer lock)
-        // would be invisible to the searcher, the count would read 0, and a
-        // still-referenced blob would be deleted.
+        // Commit the writer here so the delete (and anything else buffered) is
+        // durable before we release the lock. The deferred GC pass below will
+        // re-commit and re-count against a fresh searcher.
         fatal_commit(writer);
+
+        if eml_content_hashes.is_empty() && attachments_content_hashes.is_empty() {
+            return Ok(());
+        }
+
+        // Defer the reference-count check + blob delete past the ingest
+        // worker's commit cycle.
+        //
+        // Why: the ingest pipeline is asynchronous (producer → mpsc channel →
+        // worker → writer buffer → batched commit ≤ 60 s). An envelope queued
+        // just before this delete may still be sitting in the channel or have
+        // been received by the worker but blocked on the writer lock. Either
+        // way it is invisible to a fresh searcher right now, so an immediate
+        // ref-count would read 0 for a hash the soon-to-land envelope still
+        // references, and we would delete a blob that is about to become
+        // referenced again. PR #257 / 895ea54 closed the writer-buffer leg of
+        // this race; this closes the channel-buffer leg.
+        //
+        // Sleeping past the worker's 60 s periodic commit lets any in-flight
+        // envelope queued before this delete reach the index. The deferred
+        // pass then re-locks the writer, fatal_commits, and counts against the
+        // refreshed searcher before issuing the blob delete.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(BLOB_GC_DELAY_SECS)).await;
+            if let Err(e) =
+                ENVELOPE_MANAGER.deferred_blob_gc(eml_content_hashes, attachments_content_hashes).await
+            {
+                tracing::error!(error = ?e, "Deferred blob GC pass failed");
+            }
+        });
+
+        Ok(())
+    }
+
+    async fn deferred_blob_gc(
+        &self,
+        eml_content_hashes: HashSet<String>,
+        attachments_content_hashes: HashSet<String>,
+    ) -> BichonResult<()> {
+        let mut writer = self.index_writer.lock().await;
+        // Pull any docs the ingest worker has buffered into the writer into a
+        // committed segment and reload the reader before counting.
+        tokio::task::block_in_place(|| fatal_commit(&mut writer));
         let searcher = self.create_searcher()?;
         let fields = SchemaTools::email_fields();
+
         let mut eml: HashSet<String> = HashSet::new();
         for content_hash in eml_content_hashes {
-            // Check if any other emails still reference this content hash
             let hash_term = Term::from_field_text(fields.f_content_hash, &content_hash);
             let hash_query = TermQuery::new(hash_term, IndexRecordOption::Basic);
             let count = searcher
                 .search(&hash_query, &Count)
                 .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
-
-            // If no references found, delete from KV store
             if count == 0 {
                 eml.insert(content_hash);
             }
         }
         let mut attachments: HashSet<String> = HashSet::new();
         for content_hash in attachments_content_hashes {
-            // Check if any other emails still reference this content hash
             let hash_term = Term::from_field_text(fields.f_attachment_content_hash, &content_hash);
             let hash_query = TermQuery::new(hash_term, IndexRecordOption::Basic);
             let count = searcher
                 .search(&hash_query, &Count)
                 .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
-
-            // If no references found, delete from KV store
             if count == 0 {
                 attachments.insert(content_hash);
             }
         }
 
-        BLOB_MANAGER.delete(&eml, &attachments)
+        // Hold the writer lock across the blob delete so no ingest of an
+        // envelope referencing one of these hashes can land between the count
+        // and the delete. Producers may continue queuing into the mpsc
+        // channel, but those won't be observable until the worker can take the
+        // writer — at which point our delete has already committed.
+        let result = BLOB_MANAGER.delete(&eml, &attachments);
+        drop(writer);
+        result
     }
 
     pub async fn delete_envelopes_multi_account(

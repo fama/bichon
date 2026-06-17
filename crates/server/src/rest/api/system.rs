@@ -20,6 +20,7 @@ use crate::common::auth::WrappedContext;
 use crate::rest::api::ApiTags;
 use crate::rest::ApiResult;
 use bichon_core::dashboard::DashboardStats;
+use bichon_core::envelope::extractor::{repair_account_blobs, RepairReport};
 use bichon_core::error::code::ErrorCode;
 use bichon_core::raise_error;
 use bichon_core::settings::cli::SETTINGS;
@@ -132,6 +133,30 @@ impl SystemApi {
     ) -> ApiResult<()> {
         context.require_permission(None, Permission::ROOT)?;
         Ok(Proxy::update(id.0, url.0)?)
+    }
+    /// Repair missing detached EML blobs for an account.
+    ///
+    /// Scans every envelope on `account_id`, checks the local blob store for
+    /// each referenced `content_hash`, and re-fetches any missing blob from
+    /// the account's IMAP server. Blobs whose source message has been purged
+    /// or rewritten on the server are not recoverable and are reported under
+    /// `unrecoverable`.
+    ///
+    /// This is a synchronous, account-scoped sweep — large accounts can take
+    /// many minutes since each recovery opens a fresh IMAP connection.
+    #[oai(
+        path = "/repair-blobs/:account_id",
+        method = "post",
+        operation_id = "repair_blobs"
+    )]
+    async fn repair_blobs(
+        &self,
+        account_id: Path<u64>,
+        context: WrappedContext,
+    ) -> ApiResult<Json<RepairReport>> {
+        context.require_permission(None, Permission::ROOT)?;
+        let report = repair_account_blobs(account_id.0).await?;
+        Ok(Json(report))
     }
 
     /// Get system configurations.

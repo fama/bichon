@@ -28,7 +28,7 @@ use crate::message::content::AttachmentInfo;
 use crate::store::blob::{DetachedEmail, BLOB_MANAGER};
 use crate::store::tantivy::attachment::ATTACHMENT_MANAGER;
 use crate::store::tantivy::dedup_cache::DEDUP_CACHE;
-use crate::store::tantivy::envelope::ENVELOPE_MANAGER;
+use crate::store::tantivy::envelope::{EnvelopeRepairInfo, ENVELOPE_MANAGER};
 use crate::store::tantivy::model::{AttachmentModel, EnvelopeWithAttachments};
 use crate::utils::html::extract_text;
 use crate::utils::{compute_content_hash, hex_hash};
@@ -796,6 +796,107 @@ async fn recover_message_blob(envelope: &Envelope) -> BichonResult<Bytes> {
     detach_and_store_attachments(&raw_body, &message, &fetched_hash, envelope.account_id, envelope.mailbox_id).await;
 
     Ok(Bytes::from(raw_body))
+}
+
+/// Per-account summary of a `repair_account_blobs` pass.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "web-api", derive(poem_openapi::Object))]
+pub struct RepairReport {
+    pub account_id: u64,
+    /// Number of envelopes inspected.
+    pub envelopes_scanned: usize,
+    /// Number of distinct `content_hash` values referenced by those envelopes.
+    pub unique_hashes: usize,
+    /// Distinct hashes whose blob was missing from the local store.
+    pub missing_hashes: usize,
+    /// Distinct hashes whose blob was successfully re-fetched from IMAP.
+    pub recovered: usize,
+    /// Distinct hashes that remained missing after IMAP re-fetch (message gone
+    /// from the server, hash mismatch, or IMAP error).
+    pub unrecoverable: usize,
+    /// Distinct hashes that could not even be checked (BLOB_MANAGER lookup
+    /// failed). Counted separately from `unrecoverable`.
+    pub lookup_errors: usize,
+}
+
+/// Scan every envelope in `account_id`, find any whose detached EML blob is
+/// missing from local storage, and try to re-fetch it from the account's IMAP
+/// server. Returns a summary report.
+///
+/// One envelope per `content_hash` is sufficient to recover the blob, so
+/// duplicates across mailboxes don't multiply IMAP work. Each recovery opens a
+/// fresh IMAP connection — for large repair sweeps this is slow but keeps the
+/// code simple and matches the existing on-demand self-heal path.
+///
+/// Hashes that cannot be recovered (message purged from IMAP, or its bytes no
+/// longer hash to `content_hash`) remain orphaned and are counted in
+/// `unrecoverable`. There is no way to reconstruct them from the local store.
+pub async fn repair_account_blobs(account_id: u64) -> BichonResult<RepairReport> {
+    let scan = ENVELOPE_MANAGER.scan_envelopes_for_repair(account_id)?;
+
+    // Group by content_hash so one IMAP fetch covers every envelope that
+    // references the same blob (e.g. the same message copied across mailboxes).
+    let mut by_hash: std::collections::HashMap<String, EnvelopeRepairInfo> =
+        std::collections::HashMap::new();
+    let envelopes_scanned = scan.len();
+    for info in scan {
+        by_hash.entry(info.content_hash.clone()).or_insert(info);
+    }
+
+    let mut report = RepairReport {
+        account_id,
+        envelopes_scanned,
+        unique_hashes: by_hash.len(),
+        ..Default::default()
+    };
+
+    for (content_hash, info) in by_hash {
+        match BLOB_MANAGER.get_email(&content_hash) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                report.missing_hashes += 1;
+                let envelope = Envelope {
+                    account_id,
+                    mailbox_id: info.mailbox_id,
+                    uid: info.uid,
+                    content_hash: content_hash.clone(),
+                    ..Default::default()
+                };
+                match recover_message_blob(&envelope).await {
+                    Ok(_) => {
+                        report.recovered += 1;
+                        tracing::info!(
+                            account_id,
+                            envelope_id = %info.envelope_id,
+                            content_hash,
+                            "Repair: recovered missing blob from IMAP"
+                        );
+                    }
+                    Err(e) => {
+                        report.unrecoverable += 1;
+                        tracing::warn!(
+                            account_id,
+                            envelope_id = %info.envelope_id,
+                            content_hash,
+                            error = %e,
+                            "Repair: unable to recover missing blob"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                report.lookup_errors += 1;
+                tracing::warn!(
+                    account_id,
+                    content_hash,
+                    error = %e,
+                    "Repair: BLOB_MANAGER lookup failed"
+                );
+            }
+        }
+    }
+
+    Ok(report)
 }
 
 #[cfg(test)]
