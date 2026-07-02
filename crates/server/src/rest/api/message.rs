@@ -298,7 +298,7 @@ impl MessageApi {
         AccountModel::check_account_exists(account_id)?;
         context.require_permission(Some(account_id), Permission::DATA_READ)?;
         let content_hash = content_hash.0.trim();
-        let reader = retrieve_attachment_content(account_id, envelope_id, content_hash)?;
+        let reader = retrieve_attachment_content(account_id, envelope_id, content_hash).await?;
         let body = Body::from_async_read(reader);
         Ok(Attachment::new(body).attachment_type(AttachmentType::Inline))
     }
