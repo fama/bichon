@@ -24,9 +24,7 @@ RUN cd web && pnpm run build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY about.hbs about.toml ./
-COPY .git .git
-
-RUN git config --global --add safe.directory /build && cargo build --release
+RUN cargo build --release
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
@@ -41,7 +39,6 @@ RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib
 COPY --from=builder /build/target/release/bichon-server  /opt/bichon/bichon-server
 COPY --from=builder /build/target/release/bichon-cli     /usr/local/bin/bichon-cli
 COPY --from=builder /build/target/release/bichon-admin   /usr/local/bin/bichon-admin
-COPY LICENSE /opt/bichon/LICENSE
 
 RUN chmod +x /opt/bichon/bichon-server \
     && chmod +x /usr/local/bin/bichon-cli \
